@@ -1,0 +1,54 @@
+# --- DB connection budget (see docs/CHANGES.md for full derivation) ---
+#
+# Postgres max_connections = 100
+# Reserve 10 for superuser/admin/migrations  -> 90 usable
+# settle-worker: fixed 2 replicas x 5 conns (pool) = 10
+# Remaining for settle-api: 80
+#
+# Each settle-api pod runs GUNICORN_WORKERS=4 uvicorn workers.
+# Each worker holds a small SQLAlchemy pool: pool_size=2, max_overflow=1
+# -> worst case 3 conns per uvicorn worker -> 12 conns per pod.
+#
+# Safe max replicas = floor(80 / 12) = 6
+#
+# maxReplicas below is capped at 6 for exactly this reason. If autoscaling
+# needs to go higher, connection usage per pod must come down first
+# (e.g. PgBouncer in transaction-pooling mode in front of Postgres), not
+# the other way around.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: settle-api
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: settle-api
+  minReplicas: 3
+  maxReplicas: 6
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 120
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 60
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80

@@ -1,0 +1,104 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: settle-api-config
+data:
+  LOG_FORMAT: "json"
+  LOG_LEVEL: "info"
+  # request/trace correlation header propagated api -> redis job payload -> worker
+  REQUEST_ID_HEADER: "X-Request-Id"
+  DB_POOL_SIZE: "2"
+  DB_MAX_OVERFLOW: "1"
+  DB_STATEMENT_TIMEOUT_MS: "8000"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: settle-worker-config
+data:
+  LOG_FORMAT: "json"
+  LOG_LEVEL: "info"
+  DB_POOL_SIZE: "5"
+  DB_MAX_OVERFLOW: "0"
+  # worker stops pulling new jobs and drains on SIGTERM within this window
+  SHUTDOWN_DRAIN_SECONDS: "45"
+  # idempotency: dedupe on (job_id) before calling the mocked bank API,
+  # closing the double-payment path even if Redis redelivers a job
+  JOB_IDEMPOTENCY_ENABLED: "true"
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: settle-api-pdb
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: settle-api
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: settle-worker-pdb
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: settle-worker
+---
+# Default-deny baseline; explicit allow rules for api<->postgres/redis
+# and ingress<->api. (Task F stretch also references this file.)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress", "Egress"]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: settle-api-allow
+spec:
+  podSelector:
+    matchLabels:
+      app: settle-api
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    - from:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ingress-nginx
+      ports:
+        - port: 8000
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: postgres
+      ports:
+        - port: 5432
+    - to:
+        - podSelector:
+            matchLabels:
+              app: redis
+      ports:
+        - port: 6379
+    - ports:  # DNS
+        - port: 53
+          protocol: UDP
+---
+# NOTE: this is a TEMPLATE, not a real secret. Real values are injected
+# via `make up` from local/.env (git-ignored) or, in AWS, from
+# Secrets Manager via External Secrets Operator (see infra/terraform).
+# This file intentionally contains no real credentials.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: settle-secrets
+type: Opaque
+stringData:
+  database-url: "REPLACED_AT_DEPLOY_TIME_BY_MAKE_OR_EXTERNAL_SECRETS"
+  redis-url: "REPLACED_AT_DEPLOY_TIME_BY_MAKE_OR_EXTERNAL_SECRETS"

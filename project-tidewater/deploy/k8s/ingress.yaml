@@ -1,0 +1,30 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: settle-api
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "5"
+    # /reports/daily is documented as slow (6-9s); give it real headroom
+    # instead of a blanket short timeout that turns a slow-but-healthy
+    # request into a client-visible 504.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "15"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "15"
+    nginx.ingress.kubernetes.io/limit-rps: "50"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - settle.paylane.internal
+      secretName: settle-tls
+  rules:
+    - host: settle.paylane.internal
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: settle-api
+                port:
+                  number: 80

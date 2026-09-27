@@ -1,0 +1,186 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: settle-api
+  labels:
+    app: settle-api
+spec:
+  replicas: 3
+  revisionHistoryLimit: 5
+  strategy:
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0   # never drop capacity during a rollout
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app: settle-api
+  template:
+    metadata:
+      labels:
+        app: settle-api
+        version: PLACEHOLDER_IMAGE_TAG
+      annotations:
+        # bumped by CI on every deploy so pods always roll even if the
+        # image tag is reused (it shouldn't be, but belt and braces)
+        deploy.timestamp: "PLACEHOLDER_DEPLOY_TS"
+    spec:
+      terminationGracePeriodSeconds: 45
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: settle-api
+          image: ghcr.io/paylane/settle-api:PLACEHOLDER_IMAGE_TAG
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8000
+              name: http
+          envFrom:
+            - configMapRef:
+                name: settle-api-config
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: settle-secrets
+                  key: database-url
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: settle-secrets
+                  key: redis-url
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          # --- ROOT CAUSE FIX ---
+          # Original config used ONE probe (a DB-backed /healthz) for both
+          # liveness and readiness. When Postgres got slow, every pod
+          # failed liveness at once -> kubelet killed all of them
+          # simultaneously -> restart storm on an already struggling DB.
+          #
+          # Fix: liveness only checks "is the process alive", readiness
+          # checks "can this pod serve traffic right now" (including a
+          # cheap DB check). A slow DB now pulls pods out of the Service
+          # endpoints (readiness) WITHOUT killing/restarting them
+          # (liveness), so no thundering herd of restarts.
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+            successThreshold: 1
+          startupProbe:
+            httpGet:
+              path: /livez
+              port: http
+            failureThreshold: 30
+            periodSeconds: 2
+          lifecycle:
+            preStop:
+              exec:
+                # give in-flight requests time to drain behind the
+                # readiness change before SIGTERM propagates
+                command: ["sh", "-c", "sleep 10"]
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: settle-worker
+  labels:
+    app: settle-worker
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  strategy:
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app: settle-worker
+  template:
+    metadata:
+      labels:
+        app: settle-worker
+        version: PLACEHOLDER_IMAGE_TAG
+    spec:
+      # --- ROOT CAUSE FIX ---
+      # Original grace period was too short for an in-flight payout job
+      # to finish before SIGKILL, and the worker did not trap SIGTERM,
+      # so jobs were killed mid-payout, left un-acked, and redelivered
+      # by Redis -> reprocessed -> double payment. Fix: long enough
+      # grace period + worker traps SIGTERM, stops pulling new jobs,
+      # finishes/acks the current job, then exits. See app/ worker
+      # signal handling in docs/CHANGES.md.
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: settle-worker
+          image: ghcr.io/paylane/settle-worker:PLACEHOLDER_IMAGE_TAG
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: settle-worker-config
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: settle-secrets
+                  key: database-url
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: settle-secrets
+                  key: redis-url
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          livenessProbe:
+            exec:
+              command: ["python", "-c", "import sys; sys.exit(0)"]
+            initialDelaySeconds: 10
+            periodSeconds: 15

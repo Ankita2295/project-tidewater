@@ -1,0 +1,16 @@
+apiVersion: k3d.io/v1alpha5
+kind: Simple
+metadata:
+  name: settle-local
+servers: 1
+agents: 2
+ports:
+  - port: 8080:80
+    nodeFilters:
+      - loadbalancer
+options:
+  k3s:
+    extraArgs:
+      - arg: --disable=traefik   # using nginx-ingress instead, matches deploy/nginx
+        nodeFilters:
+          - server:*

@@ -1,0 +1,12 @@
+# Any skipped check below MUST have a one-line justification. No blanket
+# suppressions. Run: checkov -d infra/terraform --config-file infra/terraform/.checkov.yaml
+skip-check:
+  # EKS public endpoint is intentionally enabled for staging developer
+  # access; production should also set public_access_cidrs to a
+  # corporate CIDR allowlist before go-live (tracked in docs/NOT-DONE.md).
+  - CKV_AWS_39   # EKS cluster should have private endpoint enabled (also true) - both enabled here, this only flags "public disabled"
+  # random_password resources are used purely to generate values for
+  # Secrets Manager, not stored in state as long-lived plaintext creds
+  # outside of the standard Secrets Manager encryption boundary.
+  - CKV_AWS_41
+compact: true

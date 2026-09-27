@@ -1,0 +1,19 @@
+-- ============================================================
+-- ORIGINAL 0008 (as shipped in v1.8.0) — DO NOT RUN.
+-- Kept only for the historical record referenced in docs/RCA.md.
+--
+-- Why this is unsafe:
+--   1. It renames a column in place. Any v1.7 pod still running
+--      during the rolling update selects/inserts against the OLD
+--      column name and starts erroring immediately -> mid-rollout
+--      failures, exactly the kind seen in the incident window.
+--   2. It is NOT additive: a rollback from v1.8 -> v1.7 requires a
+--      down-migration to restore the old column, which risks data
+--      loss for rows written under the new name in the interim.
+--
+-- Replaced by the expand/contract sequence in 0008a_expand.sql and
+-- 0008b_contract.sql. See docs/DECISIONS.md ADR-002.
+-- ============================================================
+
+-- ALTER TABLE settlements RENAME COLUMN amount_cents TO amount;
+-- ALTER TABLE settlements ADD COLUMN settled_at TIMESTAMPTZ NOT NULL;

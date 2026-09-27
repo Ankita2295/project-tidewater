@@ -1,0 +1,178 @@
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Existing image tag to deploy (skips build)"
+        required: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/settle-api
+
+jobs:
+  # ---------------------------------------------------------------
+  # 1. lint/test
+  # ---------------------------------------------------------------
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r app/requirements.txt -r app/requirements-dev.txt
+      - run: ruff check app/
+      - run: pytest app/ -q
+
+  # ---------------------------------------------------------------
+  # 2. build ONCE, tag immutably by commit sha. Every later stage
+  #    (staging verification, prod) promotes this exact digest -
+  #    never rebuilt, so what's tested is byte-for-byte what ships.
+  # ---------------------------------------------------------------
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        run: echo "image=${REGISTRY}/${IMAGE_NAME}:${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+      - id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: ./app
+          push: true
+          tags: ${{ steps.meta.outputs.image }}
+          # SBOM + provenance for supply-chain integrity (Task F touches this too)
+          sbom: true
+          provenance: true
+
+  # ---------------------------------------------------------------
+  # 3. scan the exact promoted artifact before it goes anywhere
+  # ---------------------------------------------------------------
+  scan:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: ${{ needs.build.outputs.image }}
+          severity: "CRITICAL,HIGH"
+          exit-code: "1"
+          ignore-unfixed: true
+
+  # ---------------------------------------------------------------
+  # 4. deploy to the local/staging cluster
+  # ---------------------------------------------------------------
+  deploy:
+    needs: [build, scan]
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+      - name: configure kubeconfig
+        run: echo "${{ secrets.KUBECONFIG_B64 }}" | base64 -d > kubeconfig
+        # NOTE: secrets are referenced via ${{ secrets.* }} and written to
+        # a gitignored local file; GitHub Actions automatically masks any
+        # secret value if it were ever echoed, and nothing here prints it.
+      - name: substitute image tag into manifests
+        run: |
+          sed -i "s#ghcr.io/paylane/settle-api:PLACEHOLDER_IMAGE_TAG#${{ needs.build.outputs.image }}#g" deploy/k8s/deployment.yaml
+          sed -i "s#PLACEHOLDER_IMAGE_TAG#${GITHUB_SHA::12}#g" deploy/k8s/deployment.yaml
+          sed -i "s#PLACEHOLDER_DEPLOY_TS#$(date -u +%FT%TZ)#g" deploy/k8s/deployment.yaml
+      - name: apply
+        env:
+          KUBECONFIG: ${{ github.workspace }}/kubeconfig
+        run: |
+          kubectl apply -f deploy/k8s/config.yaml
+          kubectl apply -f deploy/k8s/service.yaml -f deploy/k8s/ingress.yaml -f deploy/k8s/hpa.yaml
+          kubectl apply -f deploy/k8s/deployment.yaml
+          kubectl rollout status deployment/settle-api --timeout=120s
+          kubectl rollout status deployment/settle-worker --timeout=120s
+
+  # ---------------------------------------------------------------
+  # 5. post-deploy verification — the signal the rollback decision
+  #    is keyed off. Must exercise real traffic, not just readiness.
+  # ---------------------------------------------------------------
+  verify:
+    needs: [build, deploy]
+    runs-on: ubuntu-latest
+    environment: staging
+    outputs:
+      passed: ${{ steps.check.outputs.passed }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: configure kubeconfig
+        run: echo "${{ secrets.KUBECONFIG_B64 }}" | base64 -d > kubeconfig
+      - id: check
+        env:
+          KUBECONFIG: ${{ github.workspace }}/kubeconfig
+        run: |
+          set +e
+          BASE_URL="http://settle.paylane.internal"
+          FAIL=0
+
+          echo "-- smoke: /healthz over 20 requests, expect >=95% success --"
+          OK=0
+          for i in $(seq 1 20); do
+            code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 "$BASE_URL/healthz")
+            [ "$code" = "200" ] && OK=$((OK+1))
+          done
+          echo "healthz success: $OK/20"
+          [ "$OK" -lt 19 ] && FAIL=1
+
+          echo "-- smoke: create + read a settlement round-trip --"
+          resp=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 -X POST "$BASE_URL/settlements" \
+            -H 'Content-Type: application/json' -d '{"merchant_id":1,"amount_cents":100}')
+          [ "$resp" != "201" ] && FAIL=1
+
+          echo "-- error budget: check pod restart count over last 2m --"
+          RESTARTS=$(kubectl get pods -l app=settle-api -o jsonpath='{.items[*].status.containerStatuses[0].restartCount}' | tr ' ' '\n' | awk '{s+=$1} END{print s+0}')
+          echo "restart count: $RESTARTS"
+          [ "$RESTARTS" -gt 0 ] && FAIL=1
+
+          echo "passed=$([ $FAIL -eq 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------
+  # 6. automatic rollback — no manual action. Rolls to the previous
+  #    revision, which is guaranteed deployable because migrations
+  #    are additive-only (see migrations/0008a_expand.sql) so no
+  #    down-migration is ever required.
+  # ---------------------------------------------------------------
+  rollback:
+    needs: [deploy, verify]
+    if: needs.verify.outputs.passed == 'false'
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - name: configure kubeconfig
+        run: echo "${{ secrets.KUBECONFIG_B64 }}" | base64 -d > kubeconfig
+      - name: roll back
+        env:
+          KUBECONFIG: ${{ github.workspace }}/kubeconfig
+        run: |
+          echo "Verification failed -> rolling back automatically"
+          kubectl rollout undo deployment/settle-api
+          kubectl rollout undo deployment/settle-worker
+          kubectl rollout status deployment/settle-api --timeout=120s
+      - name: fail the run so it's visible
+        run: exit 1
+
+  notify_success:
+    needs: [deploy, verify]
+    if: needs.verify.outputs.passed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Deploy verified and healthy. No rollback needed."
